@@ -546,4 +546,3 @@ bool gva_to_gpa(CPUState *cs, vaddr addr, int size,
     }
     return true;
 }
-

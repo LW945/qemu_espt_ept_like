@@ -34,6 +34,9 @@
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
 #include "translate-all.h"
+
+#include "sysemu/softept.h"
+
 #ifdef CONFIG_PLUGIN
 #include "qemu/plugin-memory.h"
 #endif
@@ -1396,23 +1399,95 @@ load_memop(const void *haddr, MemOp op)
     }
 }
 
+struct HelperElem helper_elem;
+
+static void sigsegv_handler(int sig){
+    CPUArchState *env = helper_elem.env;
+    target_ulong vaddr = helper_elem.addr;
+    TCGMemOpIdx oi = helper_elem.oi;
+    uintptr_t retaddr = helper_elem.retaddr;
+    MemOp op = helper_elem.op;
+    bool code_read = helper_elem.code_read;
+    uint64_t write_val = helper_elem.write_val;
+    bool is_load = helper_elem.is_load;
+
+    uintptr_t mmu_idx = get_mmuidx(oi);
+    MMUAccessType access_type =
+    code_read ? MMU_INST_FETCH : MMU_DATA_LOAD;
+    size_t size = memop_size(op);
+    CPUIOTLBEntry iotlbentry;
+    struct SofteptEntry softept_entry;
+
+    hwaddr paddr, iotlb;
+    uintptr_t addend, hva;
+
+    if(!is_load)
+	access_type = MMU_DATA_STORE;
+
+/*    assert(handle_espt_page_fault(env_cpu(env), vaddr, size,
+    access_type, mmu_idx, retaddr, &paddr, &iotlb, &addend));*/				//gva to gpa
+		
+    tlb_fill(env_cpu(env), vaddr, size, access_type, mmu_idx, retaddr);
+    uintptr_t index = tlb_index(env, mmu_idx, vaddr);
+    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, vaddr);
+    qemu_log("cputlb hvaddr: %llx\n", (uintptr_t)vaddr + entry->addend);
+
+    iotlbentry.addr = iotlb - (vaddr & TARGET_PAGE_MASK);
+    iotlbentry.attrs = cpu_get_mem_attrs(env);
+	
+    qemu_log("sigsegv_handler addr: " TARGET_FMT_lx ", paddr:" TARGET_FMT_lx "\n", vaddr, paddr);
+
+    if(!paddr){	//try to find gpa in tcg_memory_region //MMIO
+        qemu_log("mmio\n");
+        uint64_t read_val = 0;
+        if(is_load)
+            read_val = io_readx(env, &iotlbentry, mmu_idx, vaddr, retaddr, access_type, op);//todo
+        else
+            io_writex(env, &iotlbentry, mmu_idx, write_val, vaddr, retaddr, op);
+        }		
+    else{
+        hva = (uintptr_t)vaddr + addend;
+        qemu_log("hvaddr: %llx\n", hva);
+        softept_entry.set_entry.gpa = vaddr;
+        softept_entry.set_entry.hva = hva;
+        if(!softept_ioctl(SOFTEPT_SET_ENTRY, &softept_entry))
+            softept_entry_list_insert(vaddr);
+        if(!is_load)
+            notdirty_write(env_cpu(env), vaddr, size, &iotlbentry, retaddr);
+        }
+    return;
+}
+
+static void set_helper_elem(CPUArchState *env, target_ulong addr, uint64_t val,
+             TCGMemOpIdx oi, uintptr_t retaddr, MemOp op, bool code_read, bool is_load)
+{
+    helper_elem.env = env;
+    helper_elem.addr = addr;
+    helper_elem.retaddr = retaddr;
+    helper_elem.oi = oi;
+    helper_elem.op = op;
+
+    helper_elem.code_read = code_read;
+    helper_elem.write_val = val;
+    helper_elem.is_load = is_load;
+    return;
+}
+
 static inline uint64_t QEMU_ALWAYS_INLINE
 load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
             uintptr_t retaddr, MemOp op, bool code_read,
             FullLoadHelper *full_load)
 {
     uintptr_t mmu_idx = get_mmuidx(oi);
-    uintptr_t index = tlb_index(env, mmu_idx, addr);
-    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
-    target_ulong tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-    const size_t tlb_off = code_read ?
-        offsetof(CPUTLBEntry, addr_code) : offsetof(CPUTLBEntry, addr_read);
     const MMUAccessType access_type =
         code_read ? MMU_INST_FETCH : MMU_DATA_LOAD;
     unsigned a_bits = get_alignment_bits(get_memop(oi));
-    void *haddr;
+    hwaddr *gpa = NULL;
     uint64_t res;
     size_t size = memop_size(op);
+
+    set_helper_elem(env, addr, 0, oi, retaddr, op, code_read, 1);
+    signal(SIGSEGV, &sigsegv_handler);
 
     /* Handle CPU specific unaligned behaviour */
     if (addr & ((1 << a_bits) - 1)) {
@@ -1420,58 +1495,13 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                              mmu_idx, retaddr);
     }
 
-    /* If the TLB entry is for a different page, reload and try again.  */
-    if (!tlb_hit(tlb_addr, addr)) {
-        if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                            addr & TARGET_PAGE_MASK)) {
-            tlb_fill(env_cpu(env), addr, size,
-                     access_type, mmu_idx, retaddr);
-            index = tlb_index(env, mmu_idx, addr);
-            entry = tlb_entry(env, mmu_idx, addr);
-        }
-        tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-        tlb_addr &= ~TLB_INVALID_MASK;
+    /* For anything that is unaligned, recurse through full_load.  */
+    if ((addr & (size - 1)) != 0) {
+        goto do_unaligned_access;
     }
 
-    /* Handle anything that isn't just a straight memory access.  */
-    if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
-        CPUIOTLBEntry *iotlbentry;
-        bool need_swap;
-
-        /* For anything that is unaligned, recurse through full_load.  */
-        if ((addr & (size - 1)) != 0) {
-            goto do_unaligned_access;
-        }
-
-        iotlbentry = &env_tlb(env)->d[mmu_idx].iotlb[index];
-
-        /* Handle watchpoints.  */
-        if (unlikely(tlb_addr & TLB_WATCHPOINT)) {
-            /* On watchpoint hit, this will longjmp out.  */
-            cpu_check_watchpoint(env_cpu(env), addr, size,
-                                 iotlbentry->attrs, BP_MEM_READ, retaddr);
-        }
-
-        need_swap = size > 1 && (tlb_addr & TLB_BSWAP);
-
-        /* Handle I/O access.  */
-        if (likely(tlb_addr & TLB_MMIO)) {
-            return io_readx(env, iotlbentry, mmu_idx, addr, retaddr,
-                            access_type, op ^ (need_swap * MO_BSWAP));
-        }
-
-        haddr = (void *)((uintptr_t)addr + entry->addend);
-
-        /*
-         * Keep these two load_memop separate to ensure that the compiler
-         * is able to fold the entire function to a single instruction.
-         * There is a build-time assert inside to remind you of this.  ;-)
-         */
-        if (unlikely(need_swap)) {
-            return load_memop(haddr, op ^ MO_BSWAP);
-        }
-        return load_memop(haddr, op);
-    }
+    gva_to_gpa(env_cpu(env), addr, size,
+                     access_type, mmu_idx, false, retaddr, gpa);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
@@ -1497,8 +1527,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
         return res & MAKE_64BIT_MASK(0, size * 8);
     }
 
-    haddr = (void *)((uintptr_t)addr + entry->addend);
-    return load_memop(haddr, op);
+    return load_memop((void *)(*gpa), op);
 }
 
 /*
@@ -1669,8 +1698,11 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     target_ulong tlb_addr = tlb_addr_write(entry);
     const size_t tlb_off = offsetof(CPUTLBEntry, addr_write);
     unsigned a_bits = get_alignment_bits(get_memop(oi));
-    void *haddr;
+    hwaddr *gpa = NULL;
     size_t size = memop_size(op);
+
+    set_helper_elem(env, addr, val, oi, retaddr, op, 0, 0);
+    signal(SIGSEGV, &sigsegv_handler);
 
     /* Handle CPU specific unaligned behaviour */
     if (addr & ((1 << a_bits) - 1)) {
@@ -1678,117 +1710,21 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
                              mmu_idx, retaddr);
     }
 
-    /* If the TLB entry is for a different page, reload and try again.  */
-    if (!tlb_hit(tlb_addr, addr)) {
-        if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-            addr & TARGET_PAGE_MASK)) {
-            tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE,
-                     mmu_idx, retaddr);
-            index = tlb_index(env, mmu_idx, addr);
-            entry = tlb_entry(env, mmu_idx, addr);
-        }
-        tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
+    /* For anything that is unaligned, recurse through byte stores.  */
+    if ((addr & (size - 1)) != 0) {
+        goto do_unaligned_access;
     }
 
-    /* Handle anything that isn't just a straight memory access.  */
-    if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
-        CPUIOTLBEntry *iotlbentry;
-        bool need_swap;
-
-        /* For anything that is unaligned, recurse through byte stores.  */
-        if ((addr & (size - 1)) != 0) {
-            goto do_unaligned_access;
-        }
-
-        iotlbentry = &env_tlb(env)->d[mmu_idx].iotlb[index];
-
-        /* Handle watchpoints.  */
-        if (unlikely(tlb_addr & TLB_WATCHPOINT)) {
-            /* On watchpoint hit, this will longjmp out.  */
-            cpu_check_watchpoint(env_cpu(env), addr, size,
-                                 iotlbentry->attrs, BP_MEM_WRITE, retaddr);
-        }
-
-        need_swap = size > 1 && (tlb_addr & TLB_BSWAP);
-
-        /* Handle I/O access.  */
-        if (tlb_addr & TLB_MMIO) {
-            io_writex(env, iotlbentry, mmu_idx, val, addr, retaddr,
-                      op ^ (need_swap * MO_BSWAP));
-            return;
-        }
-
-        /* Ignore writes to ROM.  */
-        if (unlikely(tlb_addr & TLB_DISCARD_WRITE)) {
-            return;
-        }
-
-        /* Handle clean RAM pages.  */
-        if (tlb_addr & TLB_NOTDIRTY) {
-            notdirty_write(env_cpu(env), addr, size, iotlbentry, retaddr);
-        }
-
-        haddr = (void *)((uintptr_t)addr + entry->addend);
-
-        /*
-         * Keep these two store_memop separate to ensure that the compiler
-         * is able to fold the entire function to a single instruction.
-         * There is a build-time assert inside to remind you of this.  ;-)
-         */
-        if (unlikely(need_swap)) {
-            store_memop(haddr, val, op ^ MO_BSWAP);
-        } else {
-            store_memop(haddr, val, op);
-        }
-        return;
-    }
+    gva_to_gpa(env_cpu(env), addr, size,
+                     MMU_DATA_STORE, mmu_idx, false, retaddr, gpa);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
         && unlikely((addr & ~TARGET_PAGE_MASK) + size - 1
                      >= TARGET_PAGE_SIZE)) {
         int i;
-        uintptr_t index2;
-        CPUTLBEntry *entry2;
-        target_ulong page2, tlb_addr2;
-        size_t size2;
 
     do_unaligned_access:
-        /*
-         * Ensure the second page is in the TLB.  Note that the first page
-         * is already guaranteed to be filled, and that the second page
-         * cannot evict the first.
-         */
-        page2 = (addr + size) & TARGET_PAGE_MASK;
-        size2 = (addr + size) & ~TARGET_PAGE_MASK;
-        index2 = tlb_index(env, mmu_idx, page2);
-        entry2 = tlb_entry(env, mmu_idx, page2);
-        tlb_addr2 = tlb_addr_write(entry2);
-        if (!tlb_hit_page(tlb_addr2, page2)) {
-            if (!victim_tlb_hit(env, mmu_idx, index2, tlb_off, page2)) {
-                tlb_fill(env_cpu(env), page2, size2, MMU_DATA_STORE,
-                         mmu_idx, retaddr);
-                index2 = tlb_index(env, mmu_idx, page2);
-                entry2 = tlb_entry(env, mmu_idx, page2);
-            }
-            tlb_addr2 = tlb_addr_write(entry2);
-        }
-
-        /*
-         * Handle watchpoints.  Since this may trap, all checks
-         * must happen before any store.
-         */
-        if (unlikely(tlb_addr & TLB_WATCHPOINT)) {
-            cpu_check_watchpoint(env_cpu(env), addr, size - size2,
-                                 env_tlb(env)->d[mmu_idx].iotlb[index].attrs,
-                                 BP_MEM_WRITE, retaddr);
-        }
-        if (unlikely(tlb_addr2 & TLB_WATCHPOINT)) {
-            cpu_check_watchpoint(env_cpu(env), page2, size2,
-                                 env_tlb(env)->d[mmu_idx].iotlb[index2].attrs,
-                                 BP_MEM_WRITE, retaddr);
-        }
-
         /*
          * XXX: not efficient, but simple.
          * This loop must go in the forward direction to avoid issues
@@ -1808,8 +1744,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
         return;
     }
 
-    haddr = (void *)((uintptr_t)addr + entry->addend);
-    store_memop(haddr, val, op);
+    store_memop((void *)gpa, val, op);
 }
 
 void helper_ret_stb_mmu(CPUArchState *env, target_ulong addr, uint8_t val,

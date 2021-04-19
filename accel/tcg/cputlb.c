@@ -1400,10 +1400,15 @@ load_memop(const void *haddr, MemOp op)
 }
 
 struct HelperElem helper_elem;
+static bool has_mmio;
 
 static void sigsegv_handler(int sig){
     CPUArchState *env = helper_elem.env;
-    target_ulong vaddr = helper_elem.addr;
+    target_ulong vaddr = helper_elem.gva;
+    hwaddr paddr = helper_elem.gpa;
+    int prot = helper_elem.prot;
+    int page_size = helper_elem.page_size;
+
     TCGMemOpIdx oi = helper_elem.oi;
     uintptr_t retaddr = helper_elem.retaddr;
     MemOp op = helper_elem.op;
@@ -1415,54 +1420,66 @@ static void sigsegv_handler(int sig){
     MMUAccessType access_type =
     code_read ? MMU_INST_FETCH : MMU_DATA_LOAD;
     size_t size = memop_size(op);
-    CPUIOTLBEntry iotlbentry;
+    
     struct SofteptEntry softept_entry;
-
-    hwaddr paddr, iotlb;
-    uintptr_t addend, hva;
+    target_ulong tlb_addr;
+    CPUIOTLBEntry *iotlbentry;
+    CPUTLBEntry *entry;
+    uintptr_t index, hva;
 
     if(!is_load)
-	access_type = MMU_DATA_STORE;
-
-/*    assert(handle_espt_page_fault(env_cpu(env), vaddr, size,
-    access_type, mmu_idx, retaddr, &paddr, &iotlb, &addend));*/				//gva to gpa
+	    access_type = MMU_DATA_STORE;
 		
-    tlb_fill(env_cpu(env), vaddr, size, access_type, mmu_idx, retaddr);
-    uintptr_t index = tlb_index(env, mmu_idx, vaddr);
-    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, vaddr);
-    qemu_log("cputlb hvaddr: %llx\n", (uintptr_t)vaddr + entry->addend);
+    tlb_set_page_with_attrs(env_cpu(env), vaddr & TARGET_PAGE_MASK,
+                             paddr & TARGET_PAGE_MASK, cpu_get_mem_attrs(env), prot,
+                             mmu_idx, page_size);
+    index = tlb_index(env, mmu_idx, vaddr);
+    entry = tlb_entry(env, mmu_idx, vaddr);
 
-    iotlbentry.addr = iotlb - (vaddr & TARGET_PAGE_MASK);
-    iotlbentry.attrs = cpu_get_mem_attrs(env);
+    if(!is_load){
+        tlb_addr = tlb_addr_write(entry);
+    }
+    else{
+        tlb_addr = code_read ? entry->addr_code : entry->addr_read;
+    }
+
+    iotlbentry = &env_tlb(env)->d[mmu_idx].iotlb[index];
 	
-    qemu_log("sigsegv_handler addr: " TARGET_FMT_lx ", paddr:" TARGET_FMT_lx "\n", vaddr, paddr);
+    //qemu_log("sigsegv_handler addr: " TARGET_FMT_lx ", paddr:" TARGET_FMT_lx "\n", vaddr, paddr);
 
-    if(!paddr){	//try to find gpa in tcg_memory_region //MMIO
-        qemu_log("mmio\n");
+    if(tlb_addr & TLB_MMIO){
         uint64_t read_val = 0;
         if(is_load)
-            read_val = io_readx(env, &iotlbentry, mmu_idx, vaddr, retaddr, access_type, op);//todo
+            read_val = io_readx(env, iotlbentry, mmu_idx, vaddr, retaddr, access_type, op);//todo
         else
-            io_writex(env, &iotlbentry, mmu_idx, write_val, vaddr, retaddr, op);
-        }		
+            io_writex(env, iotlbentry, mmu_idx, write_val, vaddr, retaddr, op);
+        softept_entry.mmio_entry.gpa = paddr;
+        softept_entry.mmio_entry.val = read_val;
+        softept_entry.mmio_entry.add = 1;
+        has_mmio = 1;
+        softept_ioctl(SOFTEPT_MMIO_ENTRY, &softept_entry);
+    }		
     else{
-        hva = (uintptr_t)vaddr + addend;
-        qemu_log("hvaddr: %llx\n", hva);
-        softept_entry.set_entry.gpa = vaddr;
+        hva = (uintptr_t)vaddr + entry->addend;
+        softept_entry.set_entry.gpa = paddr;
         softept_entry.set_entry.hva = hva;
         if(!softept_ioctl(SOFTEPT_SET_ENTRY, &softept_entry))
-            softept_entry_list_insert(vaddr);
+            softept_entry_list_insert(paddr);
         if(!is_load)
-            notdirty_write(env_cpu(env), vaddr, size, &iotlbentry, retaddr);
-        }
+            notdirty_write(env_cpu(env), vaddr, size, iotlbentry, retaddr);
+    }
     return;
 }
 
-static void set_helper_elem(CPUArchState *env, target_ulong addr, uint64_t val,
+static void set_helper_elem(CPUArchState *env, target_ulong vaddr, hwaddr paddr, int prot, int page_size, uint64_t val,
              TCGMemOpIdx oi, uintptr_t retaddr, MemOp op, bool code_read, bool is_load)
 {
     helper_elem.env = env;
-    helper_elem.addr = addr;
+    helper_elem.gva = vaddr;
+    helper_elem.gpa = paddr;
+    helper_elem.page_size = page_size;
+
+    helper_elem.prot = prot;
     helper_elem.retaddr = retaddr;
     helper_elem.oi = oi;
     helper_elem.op = op;
@@ -1471,6 +1488,17 @@ static void set_helper_elem(CPUArchState *env, target_ulong addr, uint64_t val,
     helper_elem.write_val = val;
     helper_elem.is_load = is_load;
     return;
+}
+
+static void espt_mmio_redo(hwaddr paddr)
+{
+    struct SofteptEntry softept_entry;
+    if(has_mmio){
+        softept_entry.mmio_entry.gpa = paddr;
+        softept_entry.mmio_entry.add = 0;
+        softept_ioctl(SOFTEPT_MMIO_ENTRY, &softept_entry);
+        has_mmio = 0;
+    }
 }
 
 static inline uint64_t QEMU_ALWAYS_INLINE
@@ -1483,10 +1511,10 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
         code_read ? MMU_INST_FETCH : MMU_DATA_LOAD;
     unsigned a_bits = get_alignment_bits(get_memop(oi));
     hwaddr *gpa = NULL;
+    int *prot = NULL, *page_size = NULL;
     uint64_t res;
     size_t size = memop_size(op);
 
-    set_helper_elem(env, addr, 0, oi, retaddr, op, code_read, 1);
     signal(SIGSEGV, &sigsegv_handler);
 
     /* Handle CPU specific unaligned behaviour */
@@ -1501,7 +1529,9 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
     }
 
     gva_to_gpa(env_cpu(env), addr, size,
-                     access_type, mmu_idx, false, retaddr, gpa);
+                     access_type, mmu_idx, false, retaddr, gpa, prot, page_size);
+
+    set_helper_elem(env, addr, *gpa, *prot, *page_size, 0, oi, retaddr, op, code_read, 1);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
@@ -1527,7 +1557,10 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
         return res & MAKE_64BIT_MASK(0, size * 8);
     }
 
-    return load_memop((void *)(*gpa), op);
+    res = load_memop((void *)(*gpa), op);
+    espt_mmio_redo(*gpa);
+    return res;
+    
 }
 
 /*
@@ -1693,15 +1726,11 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
              TCGMemOpIdx oi, uintptr_t retaddr, MemOp op)
 {
     uintptr_t mmu_idx = get_mmuidx(oi);
-    uintptr_t index = tlb_index(env, mmu_idx, addr);
-    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
-    target_ulong tlb_addr = tlb_addr_write(entry);
-    const size_t tlb_off = offsetof(CPUTLBEntry, addr_write);
     unsigned a_bits = get_alignment_bits(get_memop(oi));
     hwaddr *gpa = NULL;
+    int *prot = NULL, *page_size = NULL;
     size_t size = memop_size(op);
 
-    set_helper_elem(env, addr, val, oi, retaddr, op, 0, 0);
     signal(SIGSEGV, &sigsegv_handler);
 
     /* Handle CPU specific unaligned behaviour */
@@ -1716,7 +1745,9 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     }
 
     gva_to_gpa(env_cpu(env), addr, size,
-                     MMU_DATA_STORE, mmu_idx, false, retaddr, gpa);
+                     MMU_DATA_STORE, mmu_idx, false, retaddr, gpa, prot, page_size);
+    
+    set_helper_elem(env, addr, *gpa, *prot, *page_size, val, oi, retaddr, op, 0, 0);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
@@ -1745,6 +1776,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     }
 
     store_memop((void *)gpa, val, op);
+    espt_mmio_redo(*gpa);
 }
 
 void helper_ret_stb_mmu(CPUArchState *env, target_ulong addr, uint8_t val,

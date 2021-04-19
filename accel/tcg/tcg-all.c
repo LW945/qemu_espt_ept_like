@@ -31,6 +31,7 @@
 #include "sysemu/cpus.h"
 #include "qemu/main-loop.h"
 
+#include "sysemu/softept.h"
 unsigned long tcg_tb_size;
 
 /* mask must never be zero, except for A20 change call */
@@ -62,6 +63,7 @@ static int tcg_init(MachineState *ms)
 {
     tcg_exec_init(tcg_tb_size * 1024 * 1024);
     cpu_interrupt_handler = tcg_handle_interrupt;
+    softept_init();
     return 0;
 }
 

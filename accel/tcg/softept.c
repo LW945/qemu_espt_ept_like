@@ -203,8 +203,8 @@ static hwaddr get_hphys(CPUState *cs, hwaddr gphys, MMUAccessType access_type,
     cpu_vmexit(env, SVM_EXIT_NPF, exit_info_1, env->retaddr);
 }
 
-static int go_through_softmmu(CPUState *cs, vaddr addr, int size,
-                            int is_write1, int mmu_idx, hwaddr *gpa)
+static int go_through_softmmu(CPUState *cs, vaddr addr, int size, int is_write1, 
+                              int mmu_idx, hwaddr *gpa, int *my_prot, int *my_page_size)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
@@ -495,6 +495,8 @@ do_check_protect_pse36:
     paddr = get_hphys(cs, pte + page_offset, is_write1, &prot);
 
     *gpa = paddr;
+    *my_prot = prot;
+    *my_page_size = page_size;
 
     /* Even if 4MB pages, we map only one 4KB page in the cache to
        avoid filling it too fast */
@@ -531,14 +533,14 @@ do_check_protect_pse36:
     return 1;
 }
 
-bool gva_to_gpa(CPUState *cs, vaddr addr, int size,
-                      MMUAccessType access_type, int mmu_idx,
-                      bool probe, uintptr_t retaddr, hwaddr *gpa)
+bool gva_to_gpa(CPUState *cs, vaddr addr, int size, MMUAccessType access_type,
+                int mmu_idx, bool probe, uintptr_t retaddr, hwaddr *gpa, 
+                int *my_prot, int *my_page_size)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
     env->retaddr = retaddr;
-    if (go_through_softmmu(cs, addr, size, access_type, mmu_idx, gpa)) {
+    if (go_through_softmmu(cs, addr, size, access_type, mmu_idx, gpa, my_prot, my_page_size)) {
         /* FIXME: On error in get_hphys we have already jumped out.  */
         g_assert(!probe);
         raise_exception_err_ra(env, cs->exception_index,

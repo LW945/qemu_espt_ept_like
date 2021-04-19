@@ -26,7 +26,10 @@
 
 struct HelperElem{
     CPUArchState *env;
-    target_ulong addr;
+    target_ulong gva;
+    hwaddr gpa;
+    int prot;
+    int page_size;
     TCGMemOpIdx oi;
     uintptr_t retaddr;
     MemOp op;
@@ -45,6 +48,11 @@ struct SofteptEntry{
             hwaddr *list;
             int size;
         }flush_entry;
+        struct{
+            hwaddr gpa;
+            uint64_t val;
+            int add;
+        }mmio_entry;
     };
 };
 struct SofteptState{
@@ -65,6 +73,7 @@ struct SofteptState{
 #define SOFTEPT_INIT _IOWR(SOFTEPTIO, 0x1, int)
 #define SOFTEPT_SET_ENTRY _IOWR(SOFTEPTIO, 0x2, struct SofteptEntry)
 #define SOFTEPT_FLUSH_ENTRY _IOWR(SOFTEPTIO, 0x3, struct SofteptEntry)
+#define SOFTEPT_MMIO_ENTRY _IOWR(SOFTEPTIO, 0x4, struct SofteptEntry)
 
 void softept_entry_list_insert(hwaddr elem);
 
@@ -74,8 +83,8 @@ int softept_ioctl(int type, ...);
 
 int softept_init(void);
 
-bool gva_to_gpa(CPUState *cs, vaddr addr, int size,
-                      MMUAccessType access_type, int mmu_idx,
-                      bool probe, uintptr_t retaddr, hwaddr *gpa);
+bool gva_to_gpa(CPUState *cs, vaddr addr, int size, MMUAccessType access_type,
+                int mmu_idx, bool probe, uintptr_t retaddr, hwaddr *gpa, 
+                int *my_prot, int *my_page_size);
 
 #endif

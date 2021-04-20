@@ -1445,7 +1445,7 @@ static void sigsegv_handler(int sig){
 
     iotlbentry = &env_tlb(env)->d[mmu_idx].iotlb[index];
 	
-    //qemu_log("sigsegv_handler addr: " TARGET_FMT_lx ", paddr:" TARGET_FMT_lx "\n", vaddr, paddr);
+    qemu_log("sigsegv_handler vaddr: " TARGET_FMT_lx ", paddr:" TARGET_FMT_lx "\n", vaddr, paddr);
 
     if(tlb_addr & TLB_MMIO){
         uint64_t read_val = 0;
@@ -1510,8 +1510,8 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
     const MMUAccessType access_type =
         code_read ? MMU_INST_FETCH : MMU_DATA_LOAD;
     unsigned a_bits = get_alignment_bits(get_memop(oi));
-    hwaddr *gpa = NULL;
-    int *prot = NULL, *page_size = NULL;
+    hwaddr gpa;
+    int prot, page_size;
     uint64_t res;
     size_t size = memop_size(op);
 
@@ -1528,10 +1528,14 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
         goto do_unaligned_access;
     }
 
+    
+    qemu_log("size: " TARGET_FMT_lx "\n", size);
+    qemu_log("load_helper addr: " TARGET_FMT_lx "\n", addr);
     gva_to_gpa(env_cpu(env), addr, size,
-                     access_type, mmu_idx, false, retaddr, gpa, prot, page_size);
-
-    set_helper_elem(env, addr, *gpa, *prot, *page_size, 0, oi, retaddr, op, code_read, 1);
+                     access_type, mmu_idx, false, retaddr, (hwaddr *)&gpa, (int *)&prot, (int *)&page_size);
+    qemu_log("load_helper addr: " TARGET_FMT_lx "\n", addr);
+    set_helper_elem(env, addr, gpa, prot, page_size, 0, oi, retaddr, op, code_read, 1);
+    qemu_log("load_helper addr: " TARGET_FMT_lx "\n", addr);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
@@ -1543,6 +1547,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
     do_unaligned_access:
         addr1 = addr & ~((target_ulong)size - 1);
         addr2 = addr1 + size;
+        qemu_log("do_unaligned_access: " TARGET_FMT_lx ", " TARGET_FMT_lx "\n", addr1, addr2);
         r1 = full_load(env, addr1, oi, retaddr);
         r2 = full_load(env, addr2, oi, retaddr);
         shift = (addr & (size - 1)) * 8;
@@ -1556,9 +1561,10 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
         }
         return res & MAKE_64BIT_MASK(0, size * 8);
     }
-
-    res = load_memop((void *)(*gpa), op);
-    espt_mmio_redo(*gpa);
+    qemu_log("load_helper addr: " TARGET_FMT_lx "\n", addr);
+    res = load_memop((void *)gpa, op);
+    qemu_log("load_helper addr: " TARGET_FMT_lx "\n", addr);
+    espt_mmio_redo(gpa);
     return res;
     
 }
@@ -1727,8 +1733,8 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
 {
     uintptr_t mmu_idx = get_mmuidx(oi);
     unsigned a_bits = get_alignment_bits(get_memop(oi));
-    hwaddr *gpa = NULL;
-    int *prot = NULL, *page_size = NULL;
+    hwaddr gpa;
+    int prot, page_size;
     size_t size = memop_size(op);
 
     signal(SIGSEGV, &sigsegv_handler);
@@ -1745,9 +1751,11 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     }
 
     gva_to_gpa(env_cpu(env), addr, size,
-                     MMU_DATA_STORE, mmu_idx, false, retaddr, gpa, prot, page_size);
+                     MMU_DATA_STORE, mmu_idx, false, retaddr, (hwaddr *)&gpa, (int *)&prot, (int *)&page_size);
     
-    set_helper_elem(env, addr, *gpa, *prot, *page_size, val, oi, retaddr, op, 0, 0);
+    set_helper_elem(env, addr, gpa, prot, page_size, val, oi, retaddr, op, 0, 0);
+
+    qemu_log("store_helper addr: " TARGET_FMT_lx "\n", addr);
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
     if (size > 1
@@ -1776,7 +1784,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     }
 
     store_memop((void *)gpa, val, op);
-    espt_mmio_redo(*gpa);
+    espt_mmio_redo(gpa);
 }
 
 void helper_ret_stb_mmu(CPUArchState *env, target_ulong addr, uint8_t val,

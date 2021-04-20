@@ -35,6 +35,7 @@
 #include "hw/boards.h"
 #include "migration/vmstate.h"
 
+#include "sysemu/softept.h"
 //#define DEBUG_UNASSIGNED
 
 static unsigned memory_region_transaction_depth;
@@ -1075,6 +1076,7 @@ void memory_region_transaction_commit(void)
             }
             ioeventfd_update_pending = false;
         }
+        softept_entry_flush_all();
    }
 }
 
